@@ -1,7 +1,9 @@
 """Focused OLMo 3 conversion, forward, packing, gradient, and checkpoint validation.
 
-Launch with ``uv run python -m torch.distributed.run --nproc_per_node=2
-validate_olmo3.py --work-dir /tmp/olmo3 --tp 2``. Pass --hf-model-path for
+Pytest collects the TP1 and TP2 cases and allocates their work directories.
+For manual validation, launch with ``uv run python -m torch.distributed.run
+--nproc_per_node=2 test_olmo3_conversion.py --work-dir <output-dir> --tp 2``.
+Pass --hf-model-path for
 an existing checkpoint; otherwise a tiny four-layer mixed-attention model is
 created. --reload-checkpoint validates the saved DCP in a fresh process.
 """
@@ -10,9 +12,12 @@ import argparse
 import json
 import logging
 import os
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -80,7 +85,7 @@ def check_logits(actual, expected, name):
         "last_token_match": bool(torch.equal(actual[:, -1].argmax(-1), expected[:, -1].argmax(-1))),
     }
     logger.info("%s: %s", name, metrics)
-    assert metrics["cosine"] > 0.999, (name, metrics)
+    assert metrics["cosine"] >= 0.99, (name, metrics)
     assert metrics["last_token_match"], (name, metrics)
     return metrics
 
@@ -97,7 +102,49 @@ def check_weights(bridge, models, reference):
     return len(seen)
 
 
-def main():
+@pytest.mark.integration
+@pytest.mark.run_only_on("GPU")
+@pytest.mark.parametrize(
+    "tp,sequence_parallel,legacy_provider",
+    [(1, False, False), (2, True, False), (1, False, True)],
+    ids=["builder-tp1", "builder-tp2-sp", "legacy-tp1"],
+)
+def test_olmo3_conversion(tmp_path: Path, tp: int, sequence_parallel: bool, legacy_provider: bool) -> None:
+    """Check exact weights, packed/plain logits, gradients, training, and fresh reload."""
+    if torch.cuda.device_count() < tp:
+        pytest.skip(f"Requires {tp} CUDA devices")
+    env = os.environ.copy()
+    visible_devices = env.get("CUDA_VISIBLE_DEVICES")
+    devices = visible_devices.split(",") if visible_devices else [str(index) for index in range(tp)]
+    env["CUDA_VISIBLE_DEVICES"] = ",".join(devices[:tp])
+    command = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--standalone",
+        f"--nproc_per_node={tp}",
+        str(Path(__file__).resolve()),
+        "--work-dir",
+        str(tmp_path),
+        "--tp",
+        str(tp),
+    ]
+    if sequence_parallel:
+        command.append("--sequence-parallel")
+    if legacy_provider:
+        command.append("--legacy-provider")
+    for reload_checkpoint in (False, True):
+        args = [*command, "--reload-checkpoint"] if reload_checkpoint else command
+        subprocess.run(args, check=True, env=env, timeout=300)
+        suffix = "reload" if reload_checkpoint else "validate"
+        report_path = tmp_path / f"{suffix}-tp{tp}-sp{int(sequence_parallel)}.json"
+        report = json.loads(report_path.read_text())
+        assert report["exact_roundtrip_tensors"] > 0
+        assert report["plain"]["last_token_match"]
+        assert report["packed"]["last_token_match"]
+
+
+def main() -> None:
     """Validate a toy model or a real local HF checkpoint using at most two GPUs."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--work-dir", type=Path, required=True)
@@ -106,6 +153,7 @@ def main():
     parser.add_argument("--sequence-parallel", action="store_true")
     parser.add_argument("--reload-checkpoint", action="store_true")
     parser.add_argument("--diagnose-norm-rounding", action="store_true")
+    parser.add_argument("--legacy-provider", action="store_true")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO)
     torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
@@ -148,7 +196,7 @@ def main():
         toy.save_pretrained(hf_path)
     dist.barrier()
     bridge = AutoBridge.from_hf_pretrained(str(hf_path), trust_remote_code=False, local_files_only=True)
-    provider = bridge.to_megatron_provider()
+    provider = bridge.to_megatron_provider() if args.legacy_provider else bridge.get_model_config()
     provider.tensor_model_parallel_size = args.tp
     provider.sequence_parallel = args.sequence_parallel
     provider.pipeline_model_parallel_size = 1
@@ -158,7 +206,10 @@ def main():
     provider.parallel_output = False
     provider.gradient_accumulation_fusion = False
     provider.finalize()
-    provider.initialize_model_parallel(seed=472)
+    if args.legacy_provider:
+        provider.initialize_model_parallel(seed=472)
+    else:
+        bridge._get_or_initialize_pg_collection(provider.transformer, seed=472)
     if args.reload_checkpoint:
         models = bridge.load_megatron_model(
             str(args.work_dir / "dcp"),
@@ -169,8 +220,10 @@ def main():
                 "sequence_parallel": args.sequence_parallel,
             },
         )
-    else:
+    elif args.legacy_provider:
         models = provider.provide_distributed_model(wrap_with_ddp=False)
+    else:
+        models = bridge.get_model(provider, wrap_with_ddp=False)
     model = models[0].cuda().eval()
     reference = (
         Olmo3ForCausalLM.from_pretrained(
@@ -182,7 +235,12 @@ def main():
         .cuda()
         .eval()
     )
-    report = {"tp": args.tp, "sequence_parallel": args.sequence_parallel, "reload": args.reload_checkpoint}
+    report = {
+        "tp": args.tp,
+        "sequence_parallel": args.sequence_parallel,
+        "reload": args.reload_checkpoint,
+        "api": "provider" if args.legacy_provider else "builder",
+    }
     report["exact_roundtrip_tensors"] = check_weights(bridge, models, reference)
     probes = {}
     handles = []

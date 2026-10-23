@@ -9,7 +9,7 @@ from transformers import Olmo3Config
 
 from megatron.bridge import AutoBridge
 from megatron.bridge.models.conversion.param_mapping import ColumnParallelMapping
-from megatron.bridge.models.olmo3 import Olmo3Bridge, Olmo3ModelProvider
+from megatron.bridge.models.olmo3 import Olmo3Bridge, Olmo3ModelBuilder, Olmo3ModelConfig, Olmo3ModelProvider
 from megatron.bridge.models.olmo3.modeling_olmo3 import Olmo3FullDimRMSNorm, Olmo3RotaryEmbedding
 
 
@@ -42,8 +42,8 @@ def config():
 
 
 def test_autobridge_and_config_roundtrip(config):
-    provider = AutoBridge.from_hf_config(config).to_megatron_provider(load_weights=False)
-    assert isinstance(provider, Olmo3ModelProvider)
+    provider = AutoBridge.from_hf_config(config).get_model_config()
+    assert isinstance(provider, Olmo3ModelConfig)
     assert not provider.qk_layernorm  # Sharded full-width norms manage their own TP reductions.
     assert provider.gated_linear_unit
     assert provider.normalization == "RMSNorm"
@@ -82,7 +82,7 @@ def test_rejects_incompatible_config(config, override):
         assert hasattr(config, name)
         setattr(config, name, value)
     with pytest.raises(ValueError):
-        Olmo3Bridge().provider_bridge(SimpleNamespace(config=config))
+        Olmo3Bridge().hf_config_to_model_config(config)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
@@ -109,7 +109,7 @@ def test_full_width_norm_forward_and_backward(dtype):
 
 
 def test_local_rope_is_unscaled_even_when_global_uses_yarn(config):
-    provider = AutoBridge.from_hf_config(config).to_megatron_provider(load_weights=False)
+    provider = AutoBridge.from_hf_config(config).get_model_config()
     provider.use_cpu_initialization = True
     # MCore eagerly populates GPU cos/sin caches even with CPU initialization.
     # Cache contents are covered by the GPU parity test; only frequencies are needed here.
@@ -135,7 +135,7 @@ def test_layerwise_rope_config_preserves_yarn_and_roundtrip(config):
             "attention_factor": 1.2079441541679836,
         },
     }
-    provider = AutoBridge.from_hf_config(config).to_megatron_provider(load_weights=False)
+    provider = AutoBridge.from_hf_config(config).get_model_config()
     assert provider.olmo3_layerwise_rope_parameters
     assert provider.olmo3_rope_parameters["rope_type"] == "yarn"
     assert provider.olmo3_rope_parameters["factor"] == 8.0
@@ -157,4 +157,81 @@ def test_rejects_unsupported_layerwise_rope(config, local_rope):
         "full_attention": {"rope_type": "default", "rope_theta": 500000},
     }
     with pytest.raises(ValueError):
-        Olmo3Bridge().provider_bridge(SimpleNamespace(config=config))
+        Olmo3Bridge().hf_config_to_model_config(config)
+
+
+def test_builder_mapping_does_not_use_legacy_provider(config):
+    bridge = Olmo3Bridge()
+    assert "provider_bridge" not in Olmo3Bridge.__dict__
+    assert Olmo3Bridge.USE_MODEL_CONFIG_FOR_CONVERSION
+    with (
+        patch.object(bridge, "provider_bridge", side_effect=AssertionError("legacy provider used")),
+        patch.object(bridge, "hf_config_to_provider_kwargs", side_effect=AssertionError("legacy kwargs used")),
+    ):
+        model_config = bridge.hf_config_to_model_config(config)
+    assert model_config.get_builder_cls() is Olmo3ModelBuilder
+    assert model_config.hidden_size == config.hidden_size
+    assert model_config.num_layers == config.num_hidden_layers
+    assert model_config.num_query_groups == config.num_key_value_heads
+    assert model_config.olmo3_layer_types == tuple(config.layer_types)
+
+
+def test_builder_config_serialization_preserves_architecture(config):
+    model_config = AutoBridge.from_hf_config(config).get_model_config()
+    restored = Olmo3ModelConfig.from_dict(model_config.as_dict())
+    assert isinstance(restored, Olmo3ModelConfig)
+    assert restored.get_builder_cls() is Olmo3ModelBuilder
+    assert restored.transformer_layer_spec is model_config.transformer_layer_spec
+    assert tuple(restored.olmo3_layer_types) == model_config.olmo3_layer_types
+    assert restored.olmo3_rope_parameters == model_config.olmo3_rope_parameters
+    assert restored.olmo3_sliding_window == model_config.olmo3_sliding_window
+    assert restored.activation_func is model_config.activation_func
+    with pytest.raises(AttributeError):
+        restored.unknown_olmo3_setting = True
+
+
+def test_legacy_provider_uses_canonical_architecture(config):
+    auto = AutoBridge.from_hf_config(config)
+    model_config = auto.get_model_config()
+    with pytest.warns(FutureWarning):
+        provider = auto.to_megatron_provider(load_weights=False)
+    assert isinstance(provider, Olmo3ModelProvider)
+    for name in (
+        "num_layers",
+        "hidden_size",
+        "ffn_hidden_size",
+        "num_attention_heads",
+        "num_query_groups",
+        "kv_channels",
+        "rotary_base",
+        "normalization",
+        "qk_layernorm",
+        "gated_linear_unit",
+        "add_bias_linear",
+        "add_qkv_bias",
+        "layernorm_epsilon",
+        "olmo3_layer_types",
+        "olmo3_sliding_window",
+        "olmo3_rope_parameters",
+        "olmo3_layerwise_rope_parameters",
+    ):
+        assert getattr(provider, name) == getattr(model_config, name), name
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"qk_layernorm": True},
+        {"position_embedding_type": "yarn"},
+        {"apply_rope_fusion": True},
+        {"flash_decode": True},
+        {"num_query_groups": 1, "tensor_model_parallel_size": 2},
+    ],
+)
+def test_builder_rejects_incompatible_runtime_overrides(config, overrides):
+    model_config = AutoBridge.from_hf_config(config).get_model_config()
+    for name, value in overrides.items():
+        assert hasattr(model_config, name)
+        setattr(model_config, name, value)
+    with pytest.raises(ValueError):
+        Olmo3ModelBuilder(model_config).build_model(SimpleNamespace())

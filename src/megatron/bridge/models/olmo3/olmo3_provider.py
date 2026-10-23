@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""OLMo 3 provider for Bridge's 0.5 provider API."""
+"""Legacy OLMo 3 provider adapter for callers such as verl."""
 
 from dataclasses import dataclass, field
 from typing import Callable
@@ -29,8 +29,8 @@ class Olmo3ModelProvider(GPTModelProvider):
     """Build OLMo 3 with post-norm residual blocks and layer-specific RoPE.
 
     Architecture dimensions are populated by AutoBridge from the HF config.
-    A custom provider is required to install the mixed rotary embedding on
-    the stock Megatron GPTModel; no Megatron-Core changes are necessary.
+    The builder-backed API is canonical. This adapter retains mixed rotary
+    construction for existing provider callers without Megatron-Core changes.
     """
 
     olmo3_layer_types: tuple[str, ...] = ()

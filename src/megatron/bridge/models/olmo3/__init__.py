@@ -12,8 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from megatron.bridge.models.olmo3.modeling_olmo3 import Olmo3ModelBuilder, Olmo3ModelConfig
 from megatron.bridge.models.olmo3.olmo3_bridge import Olmo3Bridge
 from megatron.bridge.models.olmo3.olmo3_provider import Olmo3ModelProvider
 
 
-__all__ = ["Olmo3Bridge", "Olmo3ModelProvider"]
+__all__ = ["Olmo3Bridge", "Olmo3ModelBuilder", "Olmo3ModelConfig", "Olmo3ModelProvider"]

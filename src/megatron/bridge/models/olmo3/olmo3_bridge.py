@@ -15,8 +15,10 @@
 """Bidirectional Hugging Face / Megatron conversion for dense OLMo 3."""
 
 import copy
+from typing import Any
 
 from megatron.core.models.gpt.gpt_model import GPTModel
+from transformers import PretrainedConfig
 
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
 from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
@@ -26,11 +28,11 @@ from megatron.bridge.models.conversion.param_mapping import (
     GatedMLPMapping,
     QKVMapping,
 )
-from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
+from megatron.bridge.models.olmo3.modeling_olmo3 import Olmo3ModelConfig, Olmo3PostNormLinear, olmo3_layer_spec
 from megatron.bridge.models.olmo3.olmo3_provider import Olmo3ModelProvider
 
 
-AutoMapping.register_module_type("Olmo3PostNormLinear", "row")
+AutoMapping.register_module_type(Olmo3PostNormLinear.__name__, "row")
 
 
 @MegatronModelBridge.register_bridge(
@@ -42,10 +44,12 @@ AutoMapping.register_module_type("Olmo3PostNormLinear", "row")
 class Olmo3Bridge(MegatronModelBridge):
     """Convert OLMo 3 configs and all dense checkpoint parameters."""
 
-    def provider_bridge(self, hf_pretrained: PreTrainedCausalLM) -> Olmo3ModelProvider:
+    MODEL_CONFIG_CLASS = Olmo3ModelConfig
+    USE_MODEL_CONFIG_FOR_CONVERSION = True
+
+    def hf_config_to_model_config_kwargs(self, config: PretrainedConfig) -> dict[str, Any]:
         """Translate architecture and preserve the checkpoint's mixed RoPE semantics."""
-        config = hf_pretrained.config
-        provider = super().provider_bridge(hf_pretrained)
+        kwargs = super().hf_config_to_model_config_kwargs(config)
         layer_types = tuple(config.layer_types)
         if len(layer_types) != config.num_hidden_layers or set(layer_types) - {"sliding_attention", "full_attention"}:
             raise ValueError("Unsupported OLMo 3 layer_types")
@@ -54,13 +58,13 @@ class Olmo3Bridge(MegatronModelBridge):
         if config.hidden_act != "silu" or getattr(config, "attention_bias", False):
             raise ValueError("Only bias-free SiLU OLMo 3 is supported")
         rope = copy.deepcopy(getattr(config, "rope_parameters", None) or getattr(config, "rope_scaling", None) or {})
-        provider.olmo3_layerwise_rope_parameters = "full_attention" in rope or "sliding_attention" in rope
-        if provider.olmo3_layerwise_rope_parameters:
+        layerwise_rope = "full_attention" in rope or "sliding_attention" in rope
+        if layerwise_rope:
             local_rope = rope.get("sliding_attention") or {}
             rope = rope.get("full_attention") or {}
             if local_rope.get("rope_type", local_rope.get("type", "default")) != "default":
                 raise ValueError("OLMo 3 sliding attention requires unscaled default RoPE")
-            if local_rope.get("rope_theta", provider.rotary_base) != rope.get("rope_theta", provider.rotary_base):
+            if local_rope.get("rope_theta", kwargs["rotary_base"]) != rope.get("rope_theta", kwargs["rotary_base"]):
                 raise ValueError("OLMo 3 currently requires matching local and full RoPE bases")
         rope["rope_type"] = rope.pop("type", rope.get("rope_type", "default"))
         if rope["rope_type"] not in {"default", "yarn"}:
@@ -69,27 +73,38 @@ class Olmo3Bridge(MegatronModelBridge):
             rope.setdefault("original_max_position_embeddings", config.max_position_embeddings)
             if rope.get("factor", 0) < 1:
                 raise ValueError("YaRN factor must be at least one")
-        provider.olmo3_rope_parameters = rope
-        provider.olmo3_layer_types = layer_types
-        provider.olmo3_sliding_window = config.sliding_window
-        provider.position_embedding_type = "rope"
-        provider.yarn_rotary_scaling_factor = None
-        provider.kv_channels = getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads
-        provider.normalization = "RMSNorm"
-        # Megatron's qk_layernorm flag assumes replicated per-head weights and
-        # all-reduces their gradients. Our full-width weights are TP-sharded;
-        # enable Q/K norms only on each attention module's private config.
-        provider.qk_layernorm = False
-        provider.gated_linear_unit = True
-        provider.add_bias_linear = False
-        provider.add_qkv_bias = False
-        provider.hidden_dropout = 0.0
-        provider.attention_dropout = config.attention_dropout
-        provider.apply_rope_fusion = False
-        return provider
+        kwargs.update(
+            olmo3_rope_parameters=rope,
+            olmo3_layer_types=layer_types,
+            olmo3_sliding_window=config.sliding_window,
+            olmo3_layerwise_rope_parameters=layerwise_rope,
+            transformer_layer_spec=olmo3_layer_spec,
+            position_embedding_type="rope",
+            yarn_rotary_scaling_factor=None,
+            kv_channels=getattr(config, "head_dim", None) or config.hidden_size // config.num_attention_heads,
+            normalization="RMSNorm",
+            # Full-width Q/K weights are TP-sharded, unlike the replicated
+            # per-head norms selected by Megatron's global qk_layernorm flag.
+            qk_layernorm=False,
+            gated_linear_unit=True,
+            add_bias_linear=False,
+            add_qkv_bias=False,
+            hidden_dropout=0.0,
+            attention_dropout=config.attention_dropout,
+            apply_rope_fusion=False,
+            autocast_dtype=kwargs["params_dtype"],
+            masked_softmax_fusion=True,
+            rope_scaling=False,
+            rope_scaling_factor=1.0,
+        )
+        return kwargs
+
+    def hf_config_to_provider_kwargs(self, hf_config: PretrainedConfig) -> dict[str, Any]:
+        """Keep the deprecated verl provider adapter on the canonical mapping."""
+        return self.hf_config_to_model_config_kwargs(hf_config)
 
     @classmethod
-    def megatron_to_hf_config(cls, provider: Olmo3ModelProvider) -> dict:
+    def megatron_to_hf_config(cls, provider: Olmo3ModelProvider | Olmo3ModelConfig) -> dict:
         """Restore layer types, sliding window, and the original RoPE settings on export."""
         config = super().megatron_to_hf_config(provider)
         rope = copy.deepcopy(provider.olmo3_rope_parameters)

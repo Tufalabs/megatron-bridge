@@ -16,7 +16,8 @@
 
 import copy
 import math
-from typing import TYPE_CHECKING
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, ClassVar
 
 import torch
 import torch.distributed as dist
@@ -24,7 +25,9 @@ from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
+from megatron.core.models.gpt import GPTModel
 from megatron.core.parallel_state import get_tensor_model_parallel_group
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.layers import set_tensor_model_parallel_attributes
 from megatron.core.transformer import ModuleSpec, TransformerConfig, TransformerLayer, TransformerLayerSubmodules
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
@@ -33,6 +36,9 @@ from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 from torch.distributed.nn.functional import all_reduce
 
+from megatron.bridge.models.gpt.gpt_builder import GPTModelBuilder
+from megatron.bridge.models.gpt.model_config import BridgeGPTModelConfig
+from megatron.bridge.models.transformer_config import TransformerConfig as BridgeTransformerConfig
 from megatron.bridge.utils.import_utils import safe_import_from
 
 
@@ -46,7 +52,7 @@ if TYPE_CHECKING:
     from megatron.bridge.models.olmo3.olmo3_provider import Olmo3ModelProvider
 
 
-def olmo3_layer_spec(config: "Olmo3ModelProvider") -> ModuleSpec:
+def olmo3_layer_spec(config: "Olmo3ModelProvider | Olmo3ModelConfig") -> ModuleSpec:
     """Create OLMo 3's post-norm attention/MLP blocks, without any prenorm."""
     return ModuleSpec(
         module=TransformerLayer,
@@ -92,7 +98,9 @@ class Olmo3PostNormLinear(TERowParallelLinear):
 class Olmo3FullDimRMSNorm(torch.nn.Module):
     """Full projected-width Q/K RMSNorm with sharded weights and global statistics.
 
-    TE's per-head QK norm cannot express this operation. The autograd-aware
+    TENorm has no cross-TP statistic reduction with sharded affine weights.
+    A local norm or a non-differentiable reduction loses cross-rank denominator
+    gradients. The autograd-aware
     reduction is needed in BOTH directions: a rank's Q/K gradient depends on
     the denominator contributions from every other TP rank.
     """
@@ -162,7 +170,7 @@ class Olmo3KNorm:
 class Olmo3RotaryEmbedding(RotaryEmbedding):
     """Generate default angles for local layers and optional YaRN for full layers."""
 
-    def __init__(self, config: "Olmo3ModelProvider") -> None:
+    def __init__(self, config: "Olmo3ModelProvider | Olmo3ModelConfig") -> None:
         kwargs = dict(
             kv_channels=config.kv_channels,
             rotary_percent=1.0,
@@ -201,7 +209,7 @@ class Olmo3SelfAttention(SelfAttention):
 
     def __init__(
         self,
-        config: "Olmo3ModelProvider",
+        config: "Olmo3ModelProvider | Olmo3ModelConfig",
         submodules: SelfAttentionSubmodules,
         layer_number: int,
         **kwargs: object,
@@ -268,3 +276,52 @@ class Olmo3DotProductAttention(TEDotProductAttention):
     ) -> torch.Tensor:
         """Run TE attention with matched Q/K/V dtypes."""
         return super().forward(query.to(value.dtype), key.to(value.dtype), value, *args, **kwargs)
+
+
+@dataclass
+class Olmo3TransformerConfig(BridgeTransformerConfig):
+    """Declare the per-layer rotary and window fields missing from stock GPT."""
+
+    olmo3_layer_types: tuple[str, ...] = ()
+    olmo3_sliding_window: int | None = None
+    olmo3_rope_parameters: dict = field(default_factory=dict)
+    olmo3_layerwise_rope_parameters: bool = False
+
+
+@dataclass(kw_only=True)
+class Olmo3ModelConfig(BridgeGPTModelConfig):
+    """Serializable GPT config for OLMo 3's mixed rotary construction."""
+
+    builder: ClassVar[str] = "megatron.bridge.models.olmo3.modeling_olmo3.Olmo3ModelBuilder"
+    transformer_config_class: ClassVar[type[BridgeTransformerConfig]] = Olmo3TransformerConfig
+
+
+class Olmo3ModelBuilder(GPTModelBuilder):
+    """Reuse the stock GPT builder and install per-layer rotary embeddings."""
+
+    def build_model(
+        self,
+        pg_collection: ProcessGroupCollection,
+        pre_process: bool | None = None,
+        post_process: bool | None = None,
+        vp_stage: int | None = None,
+    ) -> GPTModel:
+        """Build one GPT stage with OLMo 3's local/default and global/YaRN RoPE."""
+        config = self._model_config
+        if not isinstance(config, Olmo3ModelConfig):
+            raise TypeError(f"Expected Olmo3ModelConfig, got {type(config).__name__}.")
+        if len(config.olmo3_layer_types) != config.num_layers:
+            raise ValueError("OLMo 3 requires exactly one attention type per layer")
+        if config.num_query_groups % config.tensor_model_parallel_size:
+            raise ValueError("OLMo 3 currently requires KV heads divisible by TP size")
+        if config.flash_decode or config.fused_single_qkv_rope or config.apply_rope_fusion:
+            raise ValueError("OLMo 3 does not support fused inference RoPE")
+        if config.qk_layernorm:
+            raise ValueError(
+                "OLMo 3 full-width sharded Q/K norms require the global qk_layernorm flag to stay disabled"
+            )
+        if config.position_embedding_type != "rope" or config.yarn_rotary_scaling_factor is not None:
+            raise ValueError("OLMo 3 rotary scaling is configured per layer, not by the global GPT rotary settings")
+        model = super().build_model(pg_collection, pre_process, post_process, vp_stage)
+        model.rotary_pos_emb = Olmo3RotaryEmbedding(config)
+        return model
