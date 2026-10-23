@@ -176,6 +176,7 @@ from megatron.bridge.models.nemotron_vl import (
 from megatron.bridge.models.nemotronh import (
     NemotronHBridge,
 )
+from megatron.bridge.models.olmo3 import Olmo3Bridge, Olmo3ModelProvider
 from megatron.bridge.models.olmoe import (
     OlMoEBridge,
     OlMoEModelProvider,
@@ -292,6 +293,8 @@ __all__ = [
     "MuseSparkModel",
     "MuseSparkModelBuilder",
     "MuseSparkModelConfig",
+    "Olmo3Bridge",
+    "Olmo3ModelProvider",
     "OlMoEBridge",
     "OlMoEModelProvider",
     "NemotronHBridge",
